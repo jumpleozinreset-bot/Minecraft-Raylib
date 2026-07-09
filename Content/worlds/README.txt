@@ -1,0 +1,1 @@
+Place world folders here. Use the in-game menu to create worlds.

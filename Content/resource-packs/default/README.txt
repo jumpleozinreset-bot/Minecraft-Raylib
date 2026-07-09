@@ -1,0 +1,1 @@
+Default resource pack. Add textures in the textures folder.
