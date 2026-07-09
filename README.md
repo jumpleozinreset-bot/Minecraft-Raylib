@@ -30,7 +30,7 @@ Um clone de Minecraft desenvolvido do zero em **C++**, utilizando a biblioteca *
 ## 📦 Estrutura de Pastas (Principal)
 
 ```text
-├── src/                  
+├── Content/                  
 │   ├── worlds/            
 │   ├── resource-packs/          
 │   └── fonts/           
