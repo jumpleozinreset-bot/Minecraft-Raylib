@@ -1,0 +1,1759 @@
+#include <raylib.h>
+#include <cmath>
+#include <cstring>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <deque>
+#include <unordered_set>
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+#define GAME_API __declspec(dllexport)
+#else
+#define GAME_API
+#endif
+
+const int SCREEN_WIDTH = 1280;
+const int SCREEN_HEIGHT = 720;
+const int CHUNK_SIZE = 16;
+const int WORLD_HEIGHT = 64;
+const int WORLD_RADIUS = 1000;
+const int SEA_LEVEL = 20;
+
+enum GameState {
+    STATE_LOBBY,
+    STATE_SINGLEPLAYER_MENU,
+    STATE_CREATE_WORLD,
+    STATE_WORLD_LIST,
+    STATE_MULTIPLAYER,
+    STATE_LOADING,
+    STATE_PAUSED,
+    STATE_OPTIONS,
+    STATE_GAME
+};
+
+enum BlockType {
+    BLOCK_AIR = 0,
+    BLOCK_BEDROCK,
+    BLOCK_GRASS,
+    BLOCK_DIRT,
+    BLOCK_STONE,
+    BLOCK_SAND,
+    BLOCK_WATER,
+    BLOCK_WOOD,
+    BLOCK_LEAVES,
+    BLOCK_STONE_BRICKS,
+    BLOCK_GRAVEL,
+    BLOCK_NUM_TYPES
+};
+
+struct BlockInfo {
+    const char* name;
+    const char* file;
+    Color color;
+};
+
+static const BlockInfo BLOCKS[BLOCK_NUM_TYPES] = {
+    {"Air", "", WHITE},
+    {"Bedrock", "resource-packs/default/textures/bedrock.png", DARKGRAY},
+    {"Grass", "resource-packs/default/textures/grass.png", GREEN},
+    {"Dirt", "resource-packs/default/textures/dirt.png", BROWN},
+    {"Stone", "resource-packs/default/textures/stone.png", LIGHTGRAY},
+    {"Sand", "resource-packs/default/textures/sand.png", BEIGE},
+    {"Water", "resource-packs/default/textures/water.png", SKYBLUE},
+    {"Wood", "resource-packs/default/textures/wood.png", ORANGE},
+    {"Leaves", "resource-packs/default/textures/leaves.png", LIME},
+    {"Stone Bricks", "resource-packs/default/textures/stone_bricks.png", GRAY},
+    {"Gravel", "resource-packs/default/textures/gravel.png", DARKGRAY}
+};
+
+struct WorldInfo {
+    std::string name;
+    bool creative;
+    unsigned int seed;
+};
+
+struct ChunkCoord {
+    int x;
+    int z;
+    bool operator==(ChunkCoord const& other) const { return x == other.x && z == other.z; }
+};
+
+struct ChunkHash {
+    size_t operator()(ChunkCoord const& c) const noexcept {
+        return ((uint64_t)(uint32_t)c.x << 32) ^ (uint32_t)c.z;
+    }
+};
+
+using ChunkData = std::vector<uint8_t>;
+static std::unordered_map<ChunkCoord, ChunkData, ChunkHash> chunks;
+static Texture2D textures[BLOCK_NUM_TYPES] = {0};
+static std::vector<WorldInfo> worldList;
+static std::vector<std::string> resourcePacks;
+static int selectedPackIndex = 0;
+static int currentBlock = BLOCK_GRASS;
+static GameState state = STATE_LOBBY;
+static bool loadingInitialized = false;
+static WorldInfo currentWorld;
+static char newWorldName[64] = "My World";
+static int newWorldMode = 0;
+static int selectedWorldIndex = 0;
+static Font uiFont = {0};
+static Font fallbackFont = {0};
+static bool multiplayerEnabled = false;
+static Vector3 coopPlayerPos = {2.0f, 40.0f, 2.0f};
+static Vector3 coopPlayerVelocity = {0.0f, 0.0f, 0.0f};
+static std::vector<std::string> chatLog;
+static std::string chatInput;
+static bool chatOpen = false;
+static std::vector<std::string> commandNames;
+static std::vector<std::string> commandDescriptions;
+static int optionsTab = 0;
+static bool fancyGraphics = true;
+static float mouseSensitivity = 0.0035f;
+
+// Survival mode: health and hunger
+static float playerHealth = 20.0f;  // 20 = full health (10 hearts)
+static float playerHunger = 20.0f;  // 20 = full hunger (10 hunger bars)
+static float hungerDamageTimer = 0.0f;
+
+// Mob structure
+struct Mob {
+    Vector3 pos;           // position
+    Vector3 vel;           // velocity
+    int type;              // 0=zombie, 1=creeper, 2=skeleton
+    float health;          // mob health
+    float moveTimer;       // timer for random movement
+    float attackTimer;     // timer for attack cooldown
+    bool aggressiveMode;   // true if attacking player
+};
+
+static std::vector<Mob> mobs;
+static constexpr int MOB_TYPE_ZOMBIE = 0;
+static constexpr int MOB_TYPE_CREEPER = 1;
+static constexpr int MOB_TYPE_SKELETON = 2;
+// generation queue to avoid stalling the main thread when creating chunks
+static std::deque<ChunkCoord> generationQueueList;
+static std::unordered_set<ChunkCoord, ChunkHash> generationQueuedSet;
+static int renderRadius = 2; // chunks radius around camera to render
+static int chunksPerFrame = 1; // how many chunks to generate per frame
+static int maxCachedChunks = 48; // max chunks in memory at once
+static constexpr float UNLOAD_DISTANCE = 50.0f; // distance to unload chunks
+
+static inline Vector3 Vec3Add(const Vector3& a, const Vector3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+static inline Vector3 Vec3Scale(const Vector3& v, float s) {
+    return {v.x * s, v.y * s, v.z * s};
+}
+
+static inline int ClampInt(int value, int minVal, int maxVal) {
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
+    return value;
+}
+
+static inline float ClampFloat(float value, float minVal, float maxVal) {
+    if (value < minVal) return minVal;
+    if (value > maxVal) return maxVal;
+    return value;
+}
+
+static std::string GetResourcePackPath(int index) {
+    if (index < 0 || index >= (int)resourcePacks.size()) return "resource-packs/default";
+    return resourcePacks[index];
+}
+
+static std::string GetTexturePath(int blockIndex) {
+    if (blockIndex <= BLOCK_AIR || blockIndex >= BLOCK_NUM_TYPES) return "";
+    std::string packPath = GetResourcePackPath(selectedPackIndex);
+    std::string file = BLOCKS[blockIndex].file;
+    size_t pos = file.find_last_of('/');
+    std::string textureName = (pos == std::string::npos) ? file : file.substr(pos + 1);
+    return packPath + "/textures/" + textureName;
+}
+
+static void EnsureDirectories() {
+    fs::create_directories("resource-packs/default/textures");
+    fs::create_directories("worlds");
+    fs::create_directories("controls");
+
+    fs::path controlsFile = "controls/keybinds.txt";
+    if (!fs::exists(controlsFile)) {
+        std::ofstream out(controlsFile);
+        out << "forward=W\n";
+        out << "back=S\n";
+        out << "left=A\n";
+        out << "right=D\n";
+        out << "jump=SPACE\n";
+        out << "crouch=LEFT_SHIFT\n";
+        out.close();
+    }
+
+    fs::path packReadme = "resource-packs/default/README.txt";
+    if (!fs::exists(packReadme)) {
+        std::ofstream out(packReadme);
+        out << "Default resource pack. Add textures in the textures folder.";
+        out.close();
+    }
+
+    fs::path worldsReadme = "worlds/README.txt";
+    if (!fs::exists(worldsReadme)) {
+        std::ofstream out(worldsReadme);
+        out << "Place world folders here. Use the in-game menu to create worlds.";
+        out.close();
+    }
+}
+
+static void GenerateTextureFile(const std::string& fileName, Color color, const char* text) {
+    if (fs::exists(fileName)) return;
+    Image image = GenImageColor(64, 64, color);
+    ImageDrawText(&image, text, 6, 20, 14, BLACK);
+    ExportImage(image, fileName.c_str());
+    UnloadImage(image);
+}
+
+static void GenerateDefaultTextures() {
+    std::string packPath = "resource-packs/default/textures";
+    for (int i = 1; i < BLOCK_NUM_TYPES; i++) {
+        std::string textureName = std::string(BLOCKS[i].file).substr(std::string(BLOCKS[i].file).find_last_of('/') + 1);
+        std::string file = packPath + "/" + textureName;
+        GenerateTextureFile(file, BLOCKS[i].color, BLOCKS[i].name);
+    }
+}
+
+
+static void LoadResourcePacks() {
+    resourcePacks.clear();
+    for (auto& entry : fs::directory_iterator("resource-packs")) {
+        if (entry.is_directory()) {
+            resourcePacks.push_back(entry.path().string());
+        }
+    }
+    if (resourcePacks.empty()) resourcePacks.push_back("resource-packs/default");
+    selectedPackIndex = ClampInt(selectedPackIndex, 0, (int)resourcePacks.size() - 1);
+}
+
+static void LoadTextures() {
+    for (int i = 0; i < BLOCK_NUM_TYPES; i++) {
+        if (textures[i].id != 0) UnloadTexture(textures[i]);
+        if (i == BLOCK_AIR) {
+            textures[i].id = 0;
+            continue;
+        }
+        std::string path = GetTexturePath(i);
+        if (!fs::exists(path)) {
+            std::string fallback = "resource-packs/default/textures/" + std::string(BLOCKS[i].file).substr(std::string(BLOCKS[i].file).find_last_of('/') + 1);
+            path = fallback;
+        }
+        textures[i] = LoadTexture(path.c_str());
+    }
+}
+
+static float ValueNoise(int x, int z, unsigned int seed) {
+    uint32_t n = (uint32_t)x * 374761393u + (uint32_t)z * 668265263u + seed * 0x9e3779b9u;
+    n = (n ^ (n >> 13)) * 1274126177u;
+    return (float)(n & 0x7fffffff) / (float)0x7fffffff;
+}
+
+static float Interpolate(float a, float b, float t) {
+    float ft = t * 3.1415927f;
+    float f = (1.0f - cosf(ft)) * 0.5f;
+    return a * (1.0f - f) + b * f;
+}
+
+static float SmoothNoise(float x, float z, unsigned int seed) {
+    int xi = (int)floorf(x);
+    int zi = (int)floorf(z);
+    float xf = x - xi;
+    float zf = z - zi;
+
+    float v1 = ValueNoise(xi, zi, seed);
+    float v2 = ValueNoise(xi + 1, zi, seed);
+    float v3 = ValueNoise(xi, zi + 1, seed);
+    float v4 = ValueNoise(xi + 1, zi + 1, seed);
+
+    float i1 = Interpolate(v1, v2, xf);
+    float i2 = Interpolate(v3, v4, xf);
+    return Interpolate(i1, i2, zf);
+}
+
+static float FractalNoise(float x, float z, unsigned int seed) {
+    float total = 0.0f;
+    float frequency = 1.0f;
+    float amplitude = 1.0f;
+    float persistence = 0.5f;
+    for (int i = 0; i < 4; i++) {
+        total += SmoothNoise(x * frequency, z * frequency, seed + i * 100) * amplitude;
+        amplitude *= persistence;
+        frequency *= 2.0f;
+    }
+    return total;
+}
+
+// Check if a point should be a cave using 3D noise
+static bool IsCaveBlock(int x, int y, int z, unsigned int seed) {
+    float nx = (float)x * 0.1f;
+    float ny = (float)y * 0.15f;
+    float nz = (float)z * 0.1f;
+    
+    float caveNoise = SmoothNoise(nx, nz, seed + 1000);
+    float caveNoise2 = SmoothNoise(ny, nx, seed + 2000);
+    
+    float combined = caveNoise * caveNoise2;
+    return combined > 0.6f && y > 5 && y < 40;
+}
+
+// Generate a tree at ground level
+static void PlaceTree(ChunkData& data, int localX, int localZ, int baseY, int chunkX, int chunkZ, unsigned int seed) {
+    if (baseY < 5 || baseY > 45) return;
+    
+    // trunk (3x3 base, 5 blocks tall)
+    for (int h = 0; h < 5 && baseY + h < WORLD_HEIGHT; h++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                int lx = localX + dx;
+                int lz = localZ + dz;
+                if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+                    int index = (baseY + h) * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+                    if (index >= 0 && index < (int)data.size()) {
+                        data[index] = BLOCK_WOOD;
+                    }
+                }
+            }
+        }
+    }
+    
+    // leaves (foliage top)
+    int leafBase = baseY + 3;
+    for (int h = 0; h < 4; h++) {
+        int radius = 2 - (h > 2 ? 1 : 0);
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                int lx = localX + dx;
+                int lz = localZ + dz;
+                if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+                    int index = (leafBase + h) * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+                    if (index >= 0 && index < (int)data.size() && data[index] == BLOCK_AIR) {
+                        data[index] = BLOCK_LEAVES;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int ChunkCoordToBlock(int value) {
+    if (value >= 0) return value / CHUNK_SIZE;
+    return (value + 1) / CHUNK_SIZE - 1;
+}
+
+static int LocalBlockCoord(int value) {
+    int r = value % CHUNK_SIZE;
+    if (r < 0) r += CHUNK_SIZE;
+    return r;
+}
+
+static bool IsWithinWorld(int x, int z) {
+    return std::abs(x) <= WORLD_RADIUS && std::abs(z) <= WORLD_RADIUS;
+}
+
+static int GetTerrainHeight(int gx, int gz, unsigned int seed) {
+    if (!IsWithinWorld(gx, gz)) return -1;
+    float noise = FractalNoise(gx * 0.02f, gz * 0.02f, seed);
+    float hill = sinf(gx * 0.08f) * 7.0f + cosf(gz * 0.08f) * 7.0f;
+    int height = (int)roundf(SEA_LEVEL + noise * 12.0f + hill);
+    return ClampInt(height, 1, WORLD_HEIGHT - 5);
+}
+
+static ChunkData GenerateChunk(int chunkX, int chunkZ, unsigned int seed) {
+    ChunkData data(CHUNK_SIZE * WORLD_HEIGHT * CHUNK_SIZE, BLOCK_AIR);
+    int baseX = chunkX * CHUNK_SIZE;
+    int baseZ = chunkZ * CHUNK_SIZE;
+
+    for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+        for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+            int gx = baseX + lx;
+            int gz = baseZ + lz;
+            int height = GetTerrainHeight(gx, gz, seed);
+            
+            for (int y = 0; y < WORLD_HEIGHT; y++) {
+                int index = y * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+                
+                if (IsCaveBlock(gx, y, gz, seed)) {
+                    data[index] = BLOCK_AIR;
+                    continue;
+                }
+                
+                if (y == 0) {
+                    data[index] = BLOCK_BEDROCK;
+                } else if (y < height - 3) {
+                    data[index] = BLOCK_STONE;
+                } else if (y < height - 1) {
+                    data[index] = BLOCK_DIRT;
+                } else if (y == height - 1) {
+                    data[index] = BLOCK_GRASS;
+                } else if (y <= SEA_LEVEL && y > height) {
+                    data[index] = BLOCK_WATER;
+                } else {
+                    data[index] = BLOCK_AIR;
+                }
+            }
+            
+            // Place trees randomly
+            if (height > SEA_LEVEL && height < 50) {
+                float treeChance = ValueNoise(gx * 17, gz * 19, seed + 500);
+                if (treeChance > 0.95f) {
+                    PlaceTree(data, lx, lz, height + 1, chunkX, chunkZ, seed);
+                }
+            }
+        }
+    }
+    return data;
+}
+
+static void SaveChunkToDisk(int chunkX, int chunkZ, const ChunkData &data) {
+    fs::path dir = fs::path("worlds") / currentWorld.name / "chunks";
+    fs::create_directories(dir);
+    fs::path file = dir / (std::to_string(chunkX) + "_" + std::to_string(chunkZ) + ".chunk");
+    std::ofstream out(file, std::ios::binary);
+    if (!out.is_open()) return;
+    out.write((const char*)data.data(), data.size());
+    out.close();
+}
+
+// Unload chunks that are too far from the camera
+static void UnloadDistantChunks(float camX, float camZ) {
+    std::vector<ChunkCoord> toUnload;
+    for (auto& kv : chunks) {
+        float chunkCenterX = kv.first.x * 16.0f + 8.0f;
+        float chunkCenterZ = kv.first.z * 16.0f + 8.0f;
+        float dx = chunkCenterX - camX;
+        float dz = chunkCenterZ - camZ;
+        float dist = std::sqrt(dx * dx + dz * dz);
+        if (dist > UNLOAD_DISTANCE) {
+            toUnload.push_back(kv.first);
+        }
+    }
+    for (const auto& coord : toUnload) {
+        chunks.erase(coord);
+    }
+}
+
+// Enforce memory limit by removing chunks if too many are cached
+static void EnforceMemoryLimit() {
+    if ((int)chunks.size() > maxCachedChunks) {
+        int toRemove = chunks.size() - maxCachedChunks;
+        int removed = 0;
+        for (auto it = chunks.begin(); it != chunks.end() && removed < toRemove; ) {
+            it = chunks.erase(it);
+            removed++;
+        }
+    }
+}
+
+static ChunkData& GetChunk(int chunkX, int chunkZ, unsigned int seed);
+static void QueueNearbyChunks(int centerChunkX, int centerChunkZ, int radius);
+
+static void ProcessChunkGeneration(int maxPerFrame) {
+    if ((int)chunks.size() >= maxCachedChunks) {
+        generationQueueList.clear();
+        generationQueuedSet.clear();
+        return;
+    }
+
+    int processed = 0;
+    while (processed < maxPerFrame && !generationQueueList.empty()) {
+        ChunkCoord coord = generationQueueList.front();
+        generationQueueList.pop_front();
+        generationQueuedSet.erase(coord);
+
+        ChunkData generated = GenerateChunk(coord.x, coord.z, currentWorld.seed);
+        chunks[coord] = std::move(generated);
+        SaveChunkToDisk(coord.x, coord.z, chunks[coord]);
+
+        processed++;
+    }
+}
+
+static void PrepareInitialChunks(int centerChunkX, int centerChunkZ, int radius) {
+    QueueNearbyChunks(centerChunkX, centerChunkZ, radius);
+}
+
+// Spawn mobs in survival mode
+static void SpawnMobsIfNeeded(Vector3 playerPos) {
+    if (currentWorld.creative) return;
+    
+    static float mobSpawnTimer = 0.0f;
+    mobSpawnTimer += GetFrameTime();
+    
+    if (mobSpawnTimer > 3.0f && mobs.size() < 20) {
+        mobSpawnTimer = 0.0f;
+        
+        float angle = (float)(rand() % 360) * PI / 180.0f;
+        float dist = 30.0f + (rand() % 20);
+        
+        Mob m;
+        m.pos.x = playerPos.x + cosf(angle) * dist;
+        m.pos.y = 30.0f;
+        m.pos.z = playerPos.z + sinf(angle) * dist;
+        m.vel = {0, 0, 0};
+        m.type = rand() % 3;
+        m.health = (m.type == MOB_TYPE_CREEPER) ? 20.0f : 20.0f;
+        m.moveTimer = 0.0f;
+        m.attackTimer = 0.0f;
+        m.aggressiveMode = false;
+        
+        mobs.push_back(m);
+    }
+}
+
+// Update mobs logic
+static void UpdateMobs(Vector3 playerPos, float deltaTime) {
+    for (auto it = mobs.begin(); it != mobs.end(); ) {
+        Mob& m = *it;
+        float dx = m.pos.x - playerPos.x;
+        float dy = m.pos.y - playerPos.y;
+        float dz = m.pos.z - playerPos.z;
+        float distToPlayer = sqrtf(dx * dx + dy * dy + dz * dz);
+        
+        // Distance-based AI
+        if (distToPlayer < 30.0f && distToPlayer > 0.1f) {
+            m.aggressiveMode = true;
+            float dirX = (playerPos.x - m.pos.x) / distToPlayer;
+            float dirY = (playerPos.y - m.pos.y) / distToPlayer;
+            float dirZ = (playerPos.z - m.pos.z) / distToPlayer;
+            m.vel.x = dirX * 5.0f;
+            m.vel.y = dirY * 5.0f;
+            m.vel.z = dirZ * 5.0f;
+        } else {
+            m.aggressiveMode = false;
+            m.moveTimer += deltaTime;
+            if (m.moveTimer > 2.0f) {
+                m.moveTimer = 0.0f;
+                m.vel.x = (rand() % 100 - 50) * 0.01f * 2.0f;
+                m.vel.z = (rand() % 100 - 50) * 0.01f * 2.0f;
+            }
+        }
+        
+        m.pos = Vec3Add(m.pos, Vec3Scale(m.vel, deltaTime));
+        
+        // Attack player if close
+        if (distToPlayer < 2.0f) {
+            m.attackTimer += deltaTime;
+            if (m.attackTimer > 0.5f) {
+                m.attackTimer = 0.0f;
+                if (!currentWorld.creative) {
+                    playerHealth -= 1.0f;
+                    if (m.type == MOB_TYPE_CREEPER) {
+                        playerHealth -= 3.0f; // Creeper does more damage
+                    }
+                }
+            }
+        } else {
+            m.attackTimer = 0.0f;
+        }
+        
+        // Remove mobs that are too far
+        if (distToPlayer > 100.0f) {
+            it = mobs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void DrawLobbyBackground() {
+    DrawRectangleGradientV(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){70, 130, 180, 255}, (Color){24, 64, 126, 255});
+    DrawCircle(160, 120, 48, (Color){252, 212, 64, 255});
+    DrawCircle(220, 140, 28, (Color){255, 235, 155, 180});
+    DrawCircle(980, 120, 32, (Color){255, 255, 255, 70});
+    DrawRectangle(0, SCREEN_HEIGHT - 160, SCREEN_WIDTH, 160, (Color){25, 25, 112, 255});
+    for (int i = 0; i < 6; i++) {
+        int x = 120 + i * 180;
+        int y = SCREEN_HEIGHT - 80 - ((i % 2) * 12);
+        DrawRectangle(x, y, 120, 20, (Color){180, 205, 255, 120});
+    }
+}
+
+static bool LooksLikeUtf8(const std::string& text) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(text.c_str());
+    size_t i = 0;
+    while (i < text.size()) {
+        unsigned char c = bytes[i];
+        if (c <= 0x7F) {
+            ++i;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (i + 1 >= text.size() || (bytes[i + 1] & 0xC0) != 0x80) return false;
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            if (i + 2 >= text.size() || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            if (i + 3 >= text.size() || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string ConvertToUtf8(const std::string& text) {
+    if (text.empty() || LooksLikeUtf8(text)) {
+        return text;
+    }
+
+    std::string out;
+    out.reserve(text.size() * 2);
+    for (unsigned char c : text) {
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            continue;
+        }
+
+        unsigned int codepoint = c;
+        if (codepoint >= 0x80 && codepoint <= 0x9F) {
+            static const unsigned int cp1252[] = {
+                0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+                0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+            };
+            codepoint = cp1252[codepoint - 0x80];
+        }
+
+        if (codepoint <= 0x7F) {
+            out.push_back(static_cast<char>(codepoint));
+        } else if (codepoint <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | ((codepoint >> 6) & 0x1F)));
+            out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xE0 | ((codepoint >> 12) & 0x0F)));
+            out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
+    }
+    return out;
+}
+
+static bool TextNeedsFallbackFont(const std::string& text) {
+    for (unsigned char c : text) {
+        if (c >= 0x80) return true;
+    }
+    return false;
+}
+
+static Font GetFontForText(const std::string& text) {
+    if (TextNeedsFallbackFont(text)) {
+        if (fallbackFont.texture.id != 0 && fallbackFont.texture.id != GetFontDefault().texture.id) {
+            return fallbackFont;
+        }
+        return GetFontDefault();
+    }
+
+    if (uiFont.texture.id != 0 && uiFont.texture.id != GetFontDefault().texture.id) {
+        return uiFont;
+    }
+    return GetFontDefault();
+}
+
+static Font LoadFontWithLatinSupport(const std::string& path) {
+    if (!fs::exists(path)) {
+        return GetFontDefault();
+    }
+
+    std::vector<int> chars;
+    chars.reserve(95 + 96);
+    for (int codepoint = 32; codepoint <= 126; ++codepoint) {
+        chars.push_back(codepoint);
+    }
+    for (int codepoint = 160; codepoint <= 255; ++codepoint) {
+        chars.push_back(codepoint);
+    }
+
+    return LoadFontEx(path.c_str(), 32, chars.data(), static_cast<int>(chars.size()));
+}
+
+static void LoadUIResources() {
+    if (uiFont.texture.id != 0 && fallbackFont.texture.id != 0) return;
+
+    if (uiFont.texture.id == 0) {
+        if (fs::exists("fonts/Mojangles.ttf")) {
+            uiFont = LoadFont("fonts/Mojangles.ttf");
+        }
+        if (uiFont.texture.id == 0) {
+            uiFont = GetFontDefault();
+        }
+    }
+
+    if (fallbackFont.texture.id == 0) {
+        std::vector<std::string> candidatePaths = {
+            "fonts/arial.ttf",
+            "fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/segoeui.ttf"
+        };
+
+        for (const auto& path : candidatePaths) {
+            if (fs::exists(path)) {
+                fallbackFont = LoadFontWithLatinSupport(path);
+                if (fallbackFont.texture.id != 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (fallbackFont.texture.id == 0) {
+        fallbackFont = GetFontDefault();
+    }
+}
+
+static void UnloadUIResources() {
+    if (uiFont.texture.id != 0 && uiFont.texture.id != GetFontDefault().texture.id) {
+        UnloadFont(uiFont);
+    }
+    if (fallbackFont.texture.id != 0 && fallbackFont.texture.id != GetFontDefault().texture.id) {
+        UnloadFont(fallbackFont);
+    }
+    uiFont = GetFontDefault();
+    fallbackFont = GetFontDefault();
+}
+
+static void DrawUIText(const std::string& text, int x, int y, int fontSize, Color color) {
+    std::string normalizedText = ConvertToUtf8(text);
+    Font font = GetFontForText(normalizedText);
+    if (font.texture.id != 0 && font.texture.id != GetFontDefault().texture.id) {
+        DrawTextEx(font, normalizedText.c_str(), {(float)x, (float)y}, (float)fontSize, 1.0f, color);
+    } else {
+        DrawText(normalizedText.c_str(), x, y, fontSize, color);
+    }
+}
+
+static Vector2 MeasureUIText(const std::string& text, int fontSize) {
+    std::string normalizedText = ConvertToUtf8(text);
+    Font font = GetFontForText(normalizedText);
+    if (font.texture.id != 0 && font.texture.id != GetFontDefault().texture.id) {
+        return MeasureTextEx(font, normalizedText.c_str(), fontSize, 1.0f);
+    }
+    return MeasureTextEx(GetFontDefault(), normalizedText.c_str(), fontSize, 1.0f);
+}
+
+static ChunkData* GetLoadedChunk(int chunkX, int chunkZ) {
+    ChunkCoord coord{chunkX, chunkZ};
+    auto it = chunks.find(coord);
+    return it == chunks.end() ? nullptr : &it->second;
+}
+
+static void QueueNearbyChunks(int centerChunkX, int centerChunkZ, int radius) {
+    for (int cz = centerChunkZ - radius; cz <= centerChunkZ + radius; ++cz) {
+        for (int cx = centerChunkX - radius; cx <= centerChunkX + radius; ++cx) {
+            ChunkCoord coord{cx, cz};
+            if (chunks.find(coord) != chunks.end() || generationQueuedSet.find(coord) != generationQueuedSet.end()) {
+                continue;
+            }
+            generationQueueList.push_back(coord);
+            generationQueuedSet.insert(coord);
+        }
+    }
+}
+
+static ChunkData& GetChunk(int chunkX, int chunkZ, unsigned int seed) {
+    ChunkCoord coord{chunkX, chunkZ};
+    auto it = chunks.find(coord);
+    if (it != chunks.end()) return it->second;
+
+    // try load from disk first
+    fs::path chunkFile = fs::path("worlds") / currentWorld.name / "chunks" / (std::to_string(chunkX) + "_" + std::to_string(chunkZ) + ".chunk");
+    if (fs::exists(chunkFile)) {
+        ChunkData data(CHUNK_SIZE * WORLD_HEIGHT * CHUNK_SIZE, BLOCK_AIR);
+        std::ifstream in(chunkFile, std::ios::binary);
+        if (in.is_open()) {
+            in.read((char*)data.data(), data.size());
+            in.close();
+            auto res = chunks.emplace(coord, std::move(data));
+            return res.first->second;
+        }
+    }
+
+    // create placeholder empty chunk and enqueue generation to avoid frame hitches
+    ChunkData placeholder(CHUNK_SIZE * WORLD_HEIGHT * CHUNK_SIZE, BLOCK_AIR);
+    auto res = chunks.emplace(coord, std::move(placeholder));
+    if (generationQueuedSet.find(coord) == generationQueuedSet.end()) {
+        generationQueueList.push_back(coord);
+        generationQueuedSet.insert(coord);
+    }
+    return res.first->second;
+}
+
+static uint8_t GetBlockFast(int x, int y, int z) {
+    if (y < 0 || y >= WORLD_HEIGHT) return BLOCK_AIR;
+    if (!IsWithinWorld(x, z)) return BLOCK_AIR;
+    int chunkX = ChunkCoordToBlock(x);
+    int chunkZ = ChunkCoordToBlock(z);
+    int lx = LocalBlockCoord(x);
+    int lz = LocalBlockCoord(z);
+    ChunkData* chunk = GetLoadedChunk(chunkX, chunkZ);
+    if (!chunk) return BLOCK_AIR;
+    int index = y * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+    return (*chunk)[index];
+}
+
+static uint8_t GetBlock(int x, int y, int z, unsigned int seed) {
+    if (y < 0 || y >= WORLD_HEIGHT) return BLOCK_AIR;
+    if (!IsWithinWorld(x, z)) return BLOCK_AIR;
+    int chunkX = ChunkCoordToBlock(x);
+    int chunkZ = ChunkCoordToBlock(z);
+    int lx = LocalBlockCoord(x);
+    int lz = LocalBlockCoord(z);
+    ChunkData& chunk = GetChunk(chunkX, chunkZ, seed);
+    int index = y * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+    return chunk[index];
+}
+
+static void SetBlock(int x, int y, int z, uint8_t type, unsigned int seed) {
+    if (y < 0 || y >= WORLD_HEIGHT) return;
+    if (!IsWithinWorld(x, z)) return;
+    int chunkX = ChunkCoordToBlock(x);
+    int chunkZ = ChunkCoordToBlock(z);
+    int lx = LocalBlockCoord(x);
+    int lz = LocalBlockCoord(z);
+    ChunkData& chunk = GetChunk(chunkX, chunkZ, seed);
+    int index = y * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+    chunk[index] = type;
+}
+
+static void SaveWorldMetadata(const WorldInfo& world) {
+    fs::path worldPath = fs::path("worlds") / world.name;
+    fs::create_directories(worldPath);
+    std::ofstream out(worldPath / "metadata.txt");
+    out << "name=" << world.name << "\n";
+    out << "mode=" << (world.creative ? "creative" : "survival") << "\n";
+    out << "seed=" << world.seed << "\n";
+}
+
+static WorldInfo LoadWorldMetadata(const fs::path& worldPath) {
+    WorldInfo info;
+    info.name = worldPath.filename().string();
+    info.creative = true;
+    info.seed = (unsigned int)std::hash<std::string>()(info.name);
+
+    std::ifstream in(worldPath / "metadata.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("mode=", 0) == 0) {
+            info.creative = (line.substr(5) == "creative");
+        } else if (line.rfind("seed=", 0) == 0) {
+            info.seed = (unsigned int)std::stoul(line.substr(5));
+        }
+    }
+    return info;
+}
+
+static void LoadWorldList() {
+    worldList.clear();
+    for (auto& entry : fs::directory_iterator("worlds")) {
+        if (entry.is_directory()) {
+            worldList.push_back(LoadWorldMetadata(entry.path()));
+        }
+    }
+    selectedWorldIndex = 0;
+}
+
+static void CreateWorld(const std::string& name, bool creative) {
+    std::string safeName;
+    for (char c : name) {
+        if (std::isalnum((unsigned char)c) || c == ' ' || c == '_' || c == '-') safeName.push_back(c);
+    }
+    if (safeName.empty()) safeName = "World";
+    while (fs::exists(fs::path("worlds") / safeName)) {
+        safeName += "_1";
+    }
+    WorldInfo info;
+    info.name = safeName;
+    info.creative = creative;
+    info.seed = (unsigned int)time(NULL) ^ (unsigned int)std::hash<std::string>()(safeName);
+    SaveWorldMetadata(info);
+    LoadWorldList();
+    currentWorld = info;
+    chunks.clear();
+    generationQueueList.clear();
+    generationQueuedSet.clear();
+    loadingInitialized = false;
+    state = STATE_LOADING;
+}
+
+static bool DeleteWorld(const std::string& worldName) {
+    try {
+        fs::path worldPath = fs::path("worlds") / worldName;
+        if (fs::exists(worldPath)) {
+            fs::remove_all(worldPath);
+            LoadWorldList();
+            return true;
+        }
+    } catch (...) {
+        return false;
+    }
+    return false;
+}
+
+static void ClearChunkCache() {
+    chunks.clear();
+    generationQueueList.clear();
+    generationQueuedSet.clear();
+}
+
+static bool DrawButton(const std::string& text, Rectangle rect, Color color) {
+    Vector2 mouse = GetMousePosition();
+    bool over = CheckCollisionPointRec(mouse, rect);
+    Color bg = over ? Fade(color, 0.8f) : color;
+    DrawRectangleRec(rect, bg);
+    DrawRectangleLinesEx(rect, 2, BLACK);
+    int fontSize = 22;
+    Vector2 size = MeasureUIText(text, fontSize);
+    DrawUIText(text, (int)(rect.x + rect.width / 2 - size.x / 2), (int)(rect.y + rect.height / 2 - size.y / 2), fontSize, WHITE);
+    return over && IsMouseButtonReleased(MOUSE_LEFT_BUTTON);
+}
+
+static void DrawCenteredText(const std::string& text, int y, int fontSize, Color color) {
+    Vector2 size = MeasureUIText(text, fontSize);
+    DrawUIText(text, SCREEN_WIDTH / 2 - (int)(size.x / 2), y, fontSize, color);
+}
+
+static void LoadCommandDefinitions() {
+    commandNames.clear();
+    commandDescriptions.clear();
+    if (!fs::exists(".cmdmc")) {
+        commandNames = {"help", "version", "gamemode", "time", "weather", "tp", "spawn", "kill", "clear", "say"};
+        commandDescriptions = {
+            "Mostra os comandos disponíveis",
+            "Mostra a versão fanmade do jogo",
+            "Troca entre creative e survival",
+            "Mostra o estado do tempo",
+            "Alterna o clima",
+            "Teleporta o jogador para coordenadas",
+            "Leva o jogador para o spawn",
+            "Mata o jogador e reinicia",
+            "Limpa o chat",
+            "Envia uma mensagem ao chat"
+        };
+        return;
+    }
+
+    std::ifstream in(".cmdmc");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto pos = line.find('=');
+        if (pos == std::string::npos) {
+            commandNames.push_back(line);
+            commandDescriptions.push_back("");
+        } else {
+            commandNames.push_back(line.substr(0, pos));
+            commandDescriptions.push_back(line.substr(pos + 1));
+        }
+        if ((int)commandNames.size() >= 10) break;
+    }
+
+    if (commandNames.empty()) {
+        commandNames = {"help", "version", "gamemode", "time", "weather", "tp", "spawn", "kill", "clear", "say"};
+        commandDescriptions = {"Mostra os comandos disponíveis", "Mostra a versão do jogo", "Troca entre creative e survival", "Mostra o estado do tempo", "Alterna o clima", "Teleporta o jogador", "Leva o jogador para o spawn", "Mata o jogador", "Limpa o chat", "Envia uma mensagem"};
+    }
+}
+
+static void AddChatMessage(const std::string& msg) {
+    chatLog.push_back(msg);
+    if ((int)chatLog.size() > 8) {
+        chatLog.erase(chatLog.begin());
+    }
+}
+
+static void ProcessChatCommand(const std::string& text, Camera& camera) {
+    if (text.empty()) return;
+
+    std::string trimmed = text;
+    while (!trimmed.empty() && (trimmed.front() == '/' || trimmed.front() == ';')) {
+        trimmed.erase(trimmed.begin());
+    }
+    while (!trimmed.empty() && trimmed.back() == ' ') trimmed.pop_back();
+
+    std::string command = trimmed;
+    std::string args;
+    const auto spacePos = trimmed.find(' ');
+    if (spacePos != std::string::npos) {
+        command = trimmed.substr(0, spacePos);
+        args = trimmed.substr(spacePos + 1);
+    }
+
+    std::transform(command.begin(), command.end(), command.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (command == "help" || command == "ajuda") {
+        AddChatMessage("[cmd] Comandos: ;help ;version ;gamemode ;tp ;spawn ;kill ;clear ;say");
+        return;
+    }
+
+    if (command == "version" || command == "versao") {
+        AddChatMessage("[cmd] Versao fanmade Minecraft C++ RayLib");
+        return;
+    }
+
+    if (command == "gamemode" || command == "gm") {
+        if (args == "creative" || args == "creativo" || args == "1") {
+            currentWorld.creative = true;
+            AddChatMessage("[cmd] Modo alterado para Creative");
+        } else {
+            currentWorld.creative = false;
+            AddChatMessage("[cmd] Modo alterado para Survival");
+        }
+        return;
+    }
+
+    if (command == "time") {
+        AddChatMessage("[cmd] Tempo: dia / noite (modo fanmade)");
+        return;
+    }
+
+    if (command == "weather") {
+        AddChatMessage("[cmd] Clima: claro");
+        return;
+    }
+
+    if (command == "tp") {
+        std::istringstream iss(args);
+        float x = 0.0f, y = 40.0f, z = 0.0f;
+        iss >> x >> y >> z;
+        camera.position = {x, y, z};
+        camera.target = {x, y + 1.0f, z + 1.0f};
+        AddChatMessage("[cmd] Teleportado para as coordenadas informadas");
+        return;
+    }
+
+    if (command == "spawn") {
+        camera.position = {0.0f, 40.0f, 0.0f};
+        camera.target = {0.0f, 41.0f, 1.0f};
+        AddChatMessage("[cmd] Teleportado para o spawn");
+        return;
+    }
+
+    if (command == "kill") {
+        playerHealth = 0.0f;
+        AddChatMessage("[cmd] Você foi eliminado");
+        return;
+    }
+
+    if (command == "clear") {
+        chatLog.clear();
+        AddChatMessage("[cmd] Chat limpo");
+        return;
+    }
+
+    if (command == "say") {
+        AddChatMessage("[server] " + args);
+        return;
+    }
+
+    AddChatMessage("[cmd] Comando desconhecido. Use ;help");
+}
+
+extern "C" GAME_API int RunMinecraftRaylib() {
+    InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Minecraft Raylib Prototype");
+    SetTargetFPS(60);
+    // Disable default ESC exit so we can handle pause ourselves
+    SetExitKey(KEY_NULL);
+
+    EnsureDirectories();
+    LoadUIResources();
+    LoadCommandDefinitions();
+    LoadResourcePacks();
+    GenerateDefaultTextures();
+    LoadTextures();
+    // show cursor initially in menus
+    EnableCursor();
+    LoadWorldList();
+
+    Camera camera = {0};
+    camera.position = {0.0f, 40.0f, 0.0f};
+    camera.target = {0.0f, 40.0f, 1.0f};
+    camera.up = {0.0f, 1.0f, 0.0f};
+    camera.fovy = 70.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
+
+    float yaw = -PI / 2.0f;
+    float pitch = 0.0f;
+    const float speed = 8.5f;
+
+    GameState previousState = state;
+
+    while (!WindowShouldClose()) {
+        BeginDrawing();
+        ClearBackground(RAYWHITE);
+
+        if (state != previousState) {
+            if (state == STATE_GAME) {
+                SetMousePosition(SCREEN_WIDTH/2, SCREEN_HEIGHT/2);
+                DisableCursor();
+            } else {
+                EnableCursor();
+            }
+            previousState = state;
+        }
+
+        if (state == STATE_LOBBY) {
+            DrawLobbyBackground();
+            DrawRectangleRec({0, 0, (float)SCREEN_WIDTH, (float)SCREEN_HEIGHT}, Fade(BLACK, 0.15f));
+            DrawCenteredText("Minecraft Raylib Lobby", 80, 40, BLACK);
+            DrawUIText("Selecione um modo ou crie um mundo no singleplayer.", 360, 150, 20, DARKGRAY);
+
+            Rectangle singleRect = {(SCREEN_WIDTH - 300) / 2.0f, 220, 300, 60};
+            Rectangle multiRect = {(SCREEN_WIDTH - 300) / 2.0f, 300, 300, 60};
+            Rectangle exitRect = {(SCREEN_WIDTH - 300) / 2.0f, 380, 300, 60};
+            if (DrawButton("Singleplayer", singleRect, BLUE)) {
+                state = STATE_SINGLEPLAYER_MENU;
+            }
+            if (DrawButton("Multiplayer", multiRect, GREEN)) {
+                state = STATE_MULTIPLAYER;
+            }
+            if (DrawButton("Sair", exitRect, RED)) {
+                break;
+            }
+        } else if (state == STATE_MULTIPLAYER) {
+            DrawCenteredText("Multiplayer Local", 180, 30, BLACK);
+            DrawUIText("Modo cooperativo local: jogador 2 usa setas e Shift/Control.", 260, 240, 20, DARKGRAY);
+            Rectangle startRect = {(SCREEN_WIDTH - 300) / 2.0f, 320, 300, 60};
+            Rectangle backRect = {(SCREEN_WIDTH - 300) / 2.0f, 400, 300, 60};
+            if (DrawButton("Entrar em Co-op", startRect, GREEN)) {
+                multiplayerEnabled = true;
+                if (currentWorld.name.empty()) {
+                    CreateWorld("Co-op World", false);
+                } else {
+                    chunks.clear();
+                    generationQueueList.clear();
+                    generationQueuedSet.clear();
+                    loadingInitialized = false;
+                    state = STATE_LOADING;
+                }
+            }
+            if (DrawButton("Voltar", backRect, ORANGE)) {
+                multiplayerEnabled = false;
+                state = STATE_LOBBY;
+            }
+        } else if (state == STATE_SINGLEPLAYER_MENU) {
+            DrawCenteredText("Singleplayer", 60, 40, BLACK);
+            Rectangle createRect = {(SCREEN_WIDTH - 300) / 2.0f, 180, 300, 60};
+            Rectangle listRect = {(SCREEN_WIDTH - 300) / 2.0f, 260, 300, 60};
+            Rectangle backRect = {(SCREEN_WIDTH - 300) / 2.0f, 340, 300, 60};
+            if (DrawButton("Criar Mundo", createRect, BLUE)) {
+                state = STATE_CREATE_WORLD;
+            }
+            if (DrawButton("Lista de Mundos", listRect, GREEN)) {
+                LoadWorldList();
+                state = STATE_WORLD_LIST;
+            }
+            if (DrawButton("Voltar", backRect, GRAY)) {
+                state = STATE_LOBBY;
+            }
+        } else if (state == STATE_CREATE_WORLD) {
+            DrawCenteredText("Criar Mundo", 60, 40, BLACK);
+            DrawText("Nome do mundo:", 360, 160, 22, DARKGRAY);
+            Rectangle nameBox = {360, 190, 560, 50};
+            DrawRectangleRec(nameBox, LIGHTGRAY);
+            DrawRectangleLinesEx(nameBox, 2, BLACK);
+            DrawText(newWorldName, 370, 200, 24, BLACK);
+
+            int charPressed = GetCharPressed();
+            while (charPressed > 0) {
+                if ((char)charPressed >= 32 && (char)charPressed <= 126 && strlen(newWorldName) < sizeof(newWorldName) - 1) {
+                    int len = strlen(newWorldName);
+                    newWorldName[len] = (char)charPressed;
+                    newWorldName[len + 1] = '\0';
+                }
+                charPressed = GetCharPressed();
+            }
+            if (IsKeyPressed(KEY_BACKSPACE)) {
+                int len = strlen(newWorldName);
+                if (len > 0) newWorldName[len - 1] = '\0';
+            }
+
+            DrawText("Modo:", 360, 270, 22, DARKGRAY);
+            Rectangle creativeRect = {360, 300, 260, 50};
+            Rectangle survivalRect = {660, 300, 260, 50};
+            if (DrawButton("Criativo", creativeRect, newWorldMode == 0 ? GREEN : LIGHTGRAY)) {
+                newWorldMode = 0;
+            }
+            if (DrawButton("Sobrevivencia", survivalRect, newWorldMode == 1 ? ORANGE : LIGHTGRAY)) {
+                newWorldMode = 1;
+            }
+
+            DrawText("Packs de recursos:", 360, 380, 22, DARKGRAY);
+            Rectangle packLeft = {360, 410, 60, 50};
+            Rectangle packCenter = {430, 410, 500, 50};
+            Rectangle packRight = {940, 410, 60, 50};
+            if (DrawButton("<", packLeft, LIGHTGRAY)) {
+                selectedPackIndex = (selectedPackIndex - 1 + resourcePacks.size()) % resourcePacks.size();
+                LoadTextures();
+            }
+            std::string packName = fs::path(GetResourcePackPath(selectedPackIndex)).filename().string();
+            DrawRectangleRec(packCenter, LIGHTGRAY);
+            DrawRectangleLinesEx(packCenter, 2, BLACK);
+            DrawText(packName.c_str(), (int)(packCenter.x + 20), (int)(packCenter.y + 14), 24, BLACK);
+            if (DrawButton(">", packRight, LIGHTGRAY)) {
+                selectedPackIndex = (selectedPackIndex + 1) % resourcePacks.size();
+                LoadTextures();
+            }
+
+            Rectangle createRect = {(SCREEN_WIDTH - 300) / 2.0f, 500, 300, 60};
+            Rectangle backRect = {(SCREEN_WIDTH - 300) / 2.0f, 580, 300, 60};
+            if (DrawButton("Criar Mundo", createRect, SKYBLUE)) {
+                CreateWorld(newWorldName, newWorldMode == 0);
+            }
+            if (DrawButton("Voltar", backRect, GRAY)) {
+                state = STATE_SINGLEPLAYER_MENU;
+            }
+        } else if (state == STATE_WORLD_LIST) {
+            DrawCenteredText("Lista de Mundos", 60, 40, BLACK);
+            int listX = 220;
+            int listY = 140;
+            int itemHeight = 48;
+            for (int i = 0; i < (int)worldList.size(); i++) {
+                Rectangle itemRect = {(float)listX, (float)(listY + i * (itemHeight + 10)), 840, (float)itemHeight};
+                std::string label = worldList[i].name + " [" + (worldList[i].creative ? "Creative" : "Survival") + "]";
+                if (DrawButton(label, itemRect, i == selectedWorldIndex ? SKYBLUE : LIGHTGRAY)) {
+                    selectedWorldIndex = i;
+                }
+            }
+            Rectangle loadRect = {(SCREEN_WIDTH - 300) / 2.0f, 620, 300, 60};
+            Rectangle backRect = {(SCREEN_WIDTH - 300) / 2.0f, 690, 300, 60};
+            if (!worldList.empty() && DrawButton("Carregar Mundo", loadRect, GREEN)) {
+                currentWorld = worldList[selectedWorldIndex];
+                chunks.clear();
+                generationQueueList.clear();
+                generationQueuedSet.clear();
+                loadingInitialized = false;
+                state = STATE_LOADING;
+            }
+            if (DrawButton("Voltar", backRect, GRAY)) {
+                state = STATE_SINGLEPLAYER_MENU;
+            }
+        } else if (state == STATE_LOADING) {
+            DrawLobbyBackground();
+            DrawRectangleRec({0, 0, (float)SCREEN_WIDTH, (float)SCREEN_HEIGHT}, Fade(BLACK, 0.28f));
+            DrawCenteredText("Carregando Mundo...", SCREEN_HEIGHT / 2 - 20, 38, WHITE);
+            DrawCenteredText(TextFormat("%s", currentWorld.name.c_str()), SCREEN_HEIGHT / 2 + 30, 26, LIGHTGRAY);
+            if (!loadingInitialized) {
+                PrepareInitialChunks(0, 0, 3);
+                loadingInitialized = true;
+            }
+            ProcessChunkGeneration(chunksPerFrame * 4);
+            if (generationQueueList.empty()) {
+                state = STATE_GAME;
+            }
+        } else if (state == STATE_GAME) {
+            if (IsKeyPressed(KEY_T)) {
+                chatOpen = true;
+                chatInput.clear();
+            }
+
+            if (chatOpen) {
+                int charPressed = GetCharPressed();
+                while (charPressed > 0) {
+                    if ((char)charPressed >= 32 && (char)charPressed <= 126 && (int)chatInput.size() < 96) {
+                        chatInput.push_back((char)charPressed);
+                    }
+                    charPressed = GetCharPressed();
+                }
+                if (IsKeyPressed(KEY_BACKSPACE) && !chatInput.empty()) {
+                    chatInput.pop_back();
+                }
+                if (IsKeyPressed(KEY_ESCAPE)) {
+                    chatOpen = false;
+                    chatInput.clear();
+                }
+                if (IsKeyPressed(KEY_ENTER)) {
+                    if (!chatInput.empty()) {
+                        AddChatMessage("Você: " + chatInput);
+                        ProcessChatCommand(chatInput, camera);
+                    }
+                    chatOpen = false;
+                    chatInput.clear();
+                }
+            } else {
+                Vector2 mouseDelta = GetMouseDelta();
+                yaw += mouseDelta.x * mouseSensitivity;
+                pitch -= mouseDelta.y * mouseSensitivity;
+                pitch = ClampInt((int)roundf(pitch * 1000.0f), (int)roundf(-1.4f * 1000.0f), (int)roundf(1.4f * 1000.0f)) / 1000.0f;
+
+                Vector3 forward = {cosf(pitch) * cosf(yaw), sinf(pitch), cosf(pitch) * sinf(yaw)};
+                Vector3 forwardXZ = {cosf(yaw), 0.0f, sinf(yaw)};
+                Vector3 right = {cosf(yaw + PI / 2.0f), 0.0f, sinf(yaw + PI / 2.0f)};
+                Vector3 velocity = {0.0f, 0.0f, 0.0f};
+                float deltaTime = GetFrameTime();
+
+                if (IsKeyPressed(KEY_ESCAPE)) {
+                    state = STATE_PAUSED;
+                }
+
+                if (IsKeyDown(KEY_W)) velocity = Vec3Add(velocity, Vec3Scale(forwardXZ, speed));
+                if (IsKeyDown(KEY_S)) velocity = Vec3Add(velocity, Vec3Scale(forwardXZ, -speed));
+                if (IsKeyDown(KEY_A)) velocity = Vec3Add(velocity, Vec3Scale(right, -speed));
+                if (IsKeyDown(KEY_D)) velocity = Vec3Add(velocity, Vec3Scale(right, speed));
+                if (IsKeyDown(KEY_SPACE)) velocity.y += speed;
+                if (IsKeyDown(KEY_LEFT_SHIFT)) velocity.y -= speed;
+
+                camera.position = Vec3Add(camera.position, Vec3Scale(velocity, deltaTime));
+                camera.target = Vec3Add(camera.position, forward);
+
+            if (IsKeyPressed(KEY_ONE)) currentBlock = BLOCK_GRASS;
+            if (IsKeyPressed(KEY_TWO)) currentBlock = BLOCK_DIRT;
+            if (IsKeyPressed(KEY_THREE)) currentBlock = BLOCK_STONE;
+            if (IsKeyPressed(KEY_FOUR)) currentBlock = BLOCK_WOOD;
+            if (IsKeyPressed(KEY_FIVE)) currentBlock = BLOCK_SAND;
+
+            if (multiplayerEnabled) {
+                coopPlayerVelocity = {0.0f, 0.0f, 0.0f};
+                if (IsKeyDown(KEY_LEFT)) coopPlayerVelocity.x -= speed;
+                if (IsKeyDown(KEY_RIGHT)) coopPlayerVelocity.x += speed;
+                if (IsKeyDown(KEY_UP)) coopPlayerVelocity.z -= speed;
+                if (IsKeyDown(KEY_DOWN)) coopPlayerVelocity.z += speed;
+                if (IsKeyDown(KEY_RIGHT_CONTROL)) coopPlayerVelocity.y += speed;
+                if (IsKeyDown(KEY_RIGHT_SHIFT)) coopPlayerVelocity.y -= speed;
+                coopPlayerPos = Vec3Add(coopPlayerPos, Vec3Scale(coopPlayerVelocity, deltaTime));
+            }
+
+            Vector3 highlight = {-1, -1, -1};
+            Vector3 place = {-1, -1, -1};
+
+            Vector2 center = {(float)SCREEN_WIDTH * 0.5f, (float)SCREEN_HEIGHT * 0.5f};
+            Ray ray = GetMouseRay(center, camera);
+            Vector3 rayDir = ray.direction;
+            Vector3 rayPos = ray.position;
+            int hitX = -1, hitY = -1, hitZ = -1;
+            int prevX = -1, prevY = -1, prevZ = -1;
+
+            for (float t = 0.0f; t < 8.0f; t += 0.1f) {
+                Vector3 testPos = Vec3Add(rayPos, Vec3Scale(rayDir, t));
+                int x = (int)floorf(testPos.x);
+                int y = (int)floorf(testPos.y);
+                int z = (int)floorf(testPos.z);
+                if (!IsWithinWorld(x, z) || y < 0 || y >= WORLD_HEIGHT) continue;
+                uint8_t block = GetBlock(x, y, z, currentWorld.seed);
+                if (block != BLOCK_AIR && block != BLOCK_WATER) {
+                    hitX = x;
+                    hitY = y;
+                    hitZ = z;
+                    break;
+                }
+                prevX = x;
+                prevY = y;
+                prevZ = z;
+            }
+
+            if (hitX >= 0) {
+                highlight = {(float)hitX, (float)hitY, (float)hitZ};
+                if (prevX >= 0) {
+                    place = {(float)prevX, (float)prevY, (float)prevZ};
+                }
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                    SetBlock(hitX, hitY, hitZ, BLOCK_AIR, currentWorld.seed);
+                }
+            }
+            if (place.x >= 0 && IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+                SetBlock((int)place.x, (int)place.y, (int)place.z, currentBlock, currentWorld.seed);
+            }
+
+            // draw sky background (Minecraft-like gradient + sun)
+            DrawRectangleGradientV(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){135,206,235,255}, (Color){25,25,112,255});
+            // sun: simple filled circle near top-right
+            Vector2 sunPos = {(float)(SCREEN_WIDTH - 120), 80.0f};
+            DrawCircleV(sunPos, 48, (Color){252,212,64,255});
+
+            // Update survival mode mechanics
+            if (!currentWorld.creative) {
+                // Hunger and health
+                playerHunger -= GetFrameTime() * 0.5f; // Hunger decreases slowly
+                hungerDamageTimer += GetFrameTime();
+                
+                if (playerHunger < 0.0f) {
+                    playerHunger = 0.0f;
+                    if (hungerDamageTimer > 4.0f) { // Take damage when starving
+                        hungerDamageTimer = 0.0f;
+                        playerHealth -= 1.0f;
+                    }
+                } else {
+                    hungerDamageTimer = 0.0f;
+                }
+                
+                if (playerHealth > 20.0f) playerHealth = 20.0f;
+                if (playerHealth < 0.0f) playerHealth = 0.0f;
+                if (playerHunger > 20.0f) playerHunger = 20.0f;
+                if (playerHunger < 0.0f) playerHunger = 0.0f;
+                
+                // Spawn and update mobs
+                SpawnMobsIfNeeded(camera.position);
+                UpdateMobs(camera.position, deltaTime);
+                
+                // Die if health reaches 0
+                if (playerHealth <= 0.0f) {
+                    playerHealth = 20.0f;
+                    playerHunger = 20.0f;
+                    camera.position = {0, 50, 0};
+                }
+            } else {
+                // Creative mode: infinite health and hunger
+                playerHealth = 20.0f;
+                playerHunger = 20.0f;
+            }
+
+            BeginMode3D(camera);
+            int cameraChunkX = ChunkCoordToBlock((int)floorf(camera.position.x));
+            int cameraChunkZ = ChunkCoordToBlock((int)floorf(camera.position.z));
+            float camX = camera.position.x;
+            float camY = camera.position.y;
+            float camZ = camera.position.z;
+
+            QueueNearbyChunks(cameraChunkX, cameraChunkZ, renderRadius + 1);
+            UnloadDistantChunks(camX, camZ);
+            EnforceMemoryLimit();
+            
+            float maxRenderDist = (float)(renderRadius * CHUNK_SIZE + 8);
+            float maxRenderDistSq = maxRenderDist * maxRenderDist;
+            for (int cz = cameraChunkZ - renderRadius; cz <= cameraChunkZ + renderRadius; cz++) {
+                for (int cx = cameraChunkX - renderRadius; cx <= cameraChunkX + renderRadius; cx++) {
+                    ChunkData* chunk = GetLoadedChunk(cx, cz);
+                    if (!chunk) continue;
+                    int baseX = cx * CHUNK_SIZE;
+                    int baseZ = cz * CHUNK_SIZE;
+                    for (int lx = 0; lx < CHUNK_SIZE; lx++) {
+                        for (int lz = 0; lz < CHUNK_SIZE; lz++) {
+                            for (int y = 0; y < WORLD_HEIGHT; y++) {
+                                int index = y * CHUNK_SIZE * CHUNK_SIZE + lz * CHUNK_SIZE + lx;
+                                int block = (*chunk)[index];
+                                if (block == BLOCK_AIR) continue;
+                                float bx = (float)(baseX + lx) + 0.5f;
+                                float by = (float)y + 0.5f;
+                                float bz = (float)(baseZ + lz) + 0.5f;
+                                float dx = bx - camX; float dy = by - camY; float dz = bz - camZ;
+                                float distSq = dx*dx + dy*dy + dz*dz;
+                                if (distSq > maxRenderDistSq) continue;
+                                bool exposed = false;
+                                if (GetBlockFast(baseX + lx + 1, y, baseZ + lz) == BLOCK_AIR) exposed = true;
+                                else if (GetBlockFast(baseX + lx - 1, y, baseZ + lz) == BLOCK_AIR) exposed = true;
+                                else if (GetBlockFast(baseX + lx, y + 1, baseZ + lz) == BLOCK_AIR) exposed = true;
+                                else if (GetBlockFast(baseX + lx, y - 1, baseZ + lz) == BLOCK_AIR) exposed = true;
+                                else if (GetBlockFast(baseX + lx, y, baseZ + lz + 1) == BLOCK_AIR) exposed = true;
+                                else if (GetBlockFast(baseX + lx, y, baseZ + lz - 1) == BLOCK_AIR) exposed = true;
+                                if (!exposed) continue;
+                                Vector3 pos = {bx, by, bz};
+                                DrawCube(pos, 1.0f, 1.0f, 1.0f, BLOCKS[block].color);
+                            }
+                        }
+                    }
+                }
+            }
+            if (highlight.x >= 0) {
+                DrawCubeWires(highlight, 1.0f, 1.0f, 1.0f, YELLOW);
+            }
+            
+            if (multiplayerEnabled) {
+                DrawCube(coopPlayerPos, 0.6f, 1.8f, 0.6f, (Color){120, 150, 255, 255});
+                DrawCube({coopPlayerPos.x - 0.2f, coopPlayerPos.y + 0.4f, coopPlayerPos.z}, 0.4f, 0.4f, 0.4f, (Color){120, 150, 255, 255});
+                DrawCube({coopPlayerPos.x + 0.2f, coopPlayerPos.y + 0.4f, coopPlayerPos.z}, 0.4f, 0.4f, 0.4f, (Color){120, 150, 255, 255});
+            }
+
+            // Draw mobs
+            for (const auto& m : mobs) {
+                Color mobColor = WHITE;
+                if (m.type == MOB_TYPE_ZOMBIE) {
+                    mobColor = GREEN;
+                } else if (m.type == MOB_TYPE_CREEPER) {
+                    mobColor = (Color){0, 100, 0, 255};
+                } else if (m.type == MOB_TYPE_SKELETON) {
+                    mobColor = (Color){200, 200, 200, 255};
+                }
+                
+                DrawCube(m.pos, 0.6f, 1.8f, 0.6f, mobColor);
+                DrawCube({m.pos.x - 0.2f, m.pos.y + 0.4f, m.pos.z}, 0.4f, 0.4f, 0.4f, mobColor);
+                DrawCube({m.pos.x + 0.2f, m.pos.y + 0.4f, m.pos.z}, 0.4f, 0.4f, 0.4f, mobColor);
+                
+                // Health bar above mob
+                DrawCube({m.pos.x, m.pos.y + 1.2f, m.pos.z}, 1.0f, 0.1f, 0.1f, RED);
+                float healthPercent = m.health / 20.0f;
+                DrawCube({m.pos.x - 0.5f + 0.5f * healthPercent, m.pos.y + 1.2f, m.pos.z}, healthPercent, 0.08f, 0.08f, GREEN);
+            }
+            
+            DrawGrid(50, 5.0f);
+            EndMode3D();
+
+            DrawUIText(TextFormat("Mundo: %s [%s]", currentWorld.name.c_str(), currentWorld.creative ? "Creative" : "Survival"), 18, 18, 20, BLACK);
+            DrawUIText("WASD = mover, SPACE = subir, SHIFT = descer", 18, 42, 20, BLACK);
+            DrawUIText("Botao esquerdo = destruir, direito = colocar", 18, 66, 20, BLACK);
+            DrawUIText("1-5 = selecionar bloco", 18, 90, 20, BLACK);
+            DrawUIText("Esc = pausar", 18, 114, 20, DARKGRAY);
+            DrawUIText(TextFormat("Bloco: %s", BLOCKS[currentBlock].name), 18, 138, 20, BLACK);
+            if (multiplayerEnabled) {
+                DrawUIText("Jogador 2: setas + Ctrl/Shift", 18, 162, 20, DARKBLUE);
+            }
+            if (chatOpen) {
+                DrawRectangleRec({10, SCREEN_HEIGHT - 220, 860, 210}, Fade(BLACK, 0.58f));
+                DrawRectangleLinesEx({10, SCREEN_HEIGHT - 220, 860, 210}, 2, Fade(WHITE, 0.8f));
+                DrawUIText("Chat", 18, SCREEN_HEIGHT - 212, 20, WHITE);
+                for (int i = 0; i < (int)chatLog.size(); ++i) {
+                    DrawUIText(chatLog[i], 20, SCREEN_HEIGHT - 188 + i * 18, 18, RAYWHITE);
+                }
+
+                Rectangle inputRect = {18, SCREEN_HEIGHT - 70, 760, 38};
+                DrawRectangleRec(inputRect, Fade(DARKBLUE, 0.35f));
+                DrawRectangleLinesEx(inputRect, 2, Fade(WHITE, 0.85f));
+                DrawUIText("> " + chatInput + (GetTime() * 2.0f - floorf(GetTime() * 2.0f) < 0.5f ? "_" : ""), 28, SCREEN_HEIGHT - 60, 20, WHITE);
+
+                std::vector<std::string> quickCommands = {";help", ";version", ";spawn", ";tp 0 40 0"};
+                std::vector<Rectangle> quickRects;
+                int buttonY = SCREEN_HEIGHT - 110;
+                int buttonW = 110;
+                int buttonH = 28;
+                for (int i = 0; i < (int)quickCommands.size(); ++i) {
+                    Rectangle rect = {(float)(18 + i * (buttonW + 8)), (float)buttonY, (float)buttonW, (float)buttonH};
+                    quickRects.push_back(rect);
+                    DrawRectangleRec(rect, Fade(LIGHTGRAY, 0.18f));
+                    DrawRectangleLinesEx(rect, 1, Fade(WHITE, 0.8f));
+                    DrawUIText(quickCommands[i], (int)rect.x + 8, (int)rect.y + 6, 16, WHITE);
+                }
+                Vector2 mouse = GetMousePosition();
+                for (int i = 0; i < (int)quickRects.size(); ++i) {
+                    if (CheckCollisionPointRec(mouse, quickRects[i]) && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                        chatInput = quickCommands[i];
+                    }
+                }
+
+                Rectangle sendRect = {(float)(790), (float)(SCREEN_HEIGHT - 70), 78, 38};
+                DrawRectangleRec(sendRect, Fade(GREEN, 0.55f));
+                DrawRectangleLinesEx(sendRect, 2, WHITE);
+                DrawUIText("Enviar", (int)sendRect.x + 10, (int)sendRect.y + 10, 16, WHITE);
+                if (CheckCollisionPointRec(mouse, sendRect) && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                    if (!chatInput.empty()) {
+                        AddChatMessage("Você: " + chatInput);
+                        ProcessChatCommand(chatInput, camera);
+                    }
+                    chatOpen = false;
+                    chatInput.clear();
+                }
+
+                Rectangle closeRect = {(float)(790), (float)(SCREEN_HEIGHT - 112), 78, 28};
+                DrawRectangleRec(closeRect, Fade(RED, 0.55f));
+                DrawRectangleLinesEx(closeRect, 1, WHITE);
+                DrawUIText("Fechar", (int)closeRect.x + 10, (int)closeRect.y + 6, 16, WHITE);
+                if (CheckCollisionPointRec(mouse, closeRect) && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
+                    chatOpen = false;
+                    chatInput.clear();
+                }
+            } else {
+                DrawRectangleRec({12, SCREEN_HEIGHT - 92, 760, 72}, Fade(BLACK, 0.35f));
+                for (int i = 0; i < (int)chatLog.size(); ++i) {
+                    DrawUIText(chatLog[i], 20, SCREEN_HEIGHT - 84 + i * 16, 16, RAYWHITE);
+                }
+            }
+
+            int hotbarSize = 5;
+            int slotSize = 52;
+            int spacing = 8;
+            int totalWidth = hotbarSize * slotSize + (hotbarSize - 1) * spacing;
+            int startX = SCREEN_WIDTH / 2 - totalWidth / 2;
+            int y = SCREEN_HEIGHT - slotSize - 20;
+            for (int i = 0; i < hotbarSize; i++) {
+                Rectangle slotRect = {(float)(startX + i * (slotSize + spacing)), (float)y, (float)slotSize, (float)slotSize};
+                DrawRectangleRec(slotRect, DARKGRAY);
+                DrawRectangleLinesEx(slotRect, 3, i + 1 == currentBlock ? YELLOW : BLACK);
+                int blockIndex = i + 1;
+                if (blockIndex < BLOCK_NUM_TYPES && textures[blockIndex].id != 0) {
+                    Rectangle src = {0.0f, 0.0f, (float)textures[blockIndex].width, (float)textures[blockIndex].height};
+                    Rectangle dst = {slotRect.x + 6.0f, slotRect.y + 6.0f, slotRect.width - 12.0f, slotRect.height - 12.0f};
+                    DrawTexturePro(textures[blockIndex], src, dst, {0.0f, 0.0f}, 0.0f, WHITE);
+                }
+                DrawText(TextFormat("%d", blockIndex), (int)slotRect.x + 4, (int)slotRect.y + 4, 18, RAYWHITE);
+            }
+
+            // Draw health and hunger HUD (Minecraft style)
+            if (!currentWorld.creative) {
+                // Hearts (health)
+                int heartX = 20;
+                int heartY = SCREEN_HEIGHT - 140;
+                for (int i = 0; i < 10; i++) {
+                    if (i * 2 < playerHealth) {
+                        DrawText("❤", heartX + i * 20, heartY, 18, RED);
+                    } else {
+                        DrawText("♡", heartX + i * 20, heartY, 18, DARKGRAY);
+                    }
+                }
+                
+                // Hunger bars
+                int hungerX = SCREEN_WIDTH - 220;
+                int hungerY = SCREEN_HEIGHT - 140;
+                DrawText("Fome:", hungerX, hungerY, 16, WHITE);
+                for (int i = 0; i < 10; i++) {
+                    if (i * 2 < playerHunger) {
+                        DrawRectangle(hungerX + i * 18, hungerY + 20, 16, 16, ORANGE);
+                    } else {
+                        DrawRectangle(hungerX + i * 18, hungerY + 20, 16, 16, DARKGRAY);
+                    }
+                }
+            }
+
+            if (IsKeyPressed(KEY_ESCAPE)) {
+                state = STATE_PAUSED;
+            }
+            // process at most a few chunk generations per frame to avoid hitches
+            ProcessChunkGeneration(chunksPerFrame);
+        }
+        }
+
+        else if (state == STATE_OPTIONS) {
+            DrawRectangleRec({0, 0, (float)SCREEN_WIDTH, (float)SCREEN_HEIGHT}, Fade(BLACK, 0.45f));
+            DrawCenteredText("Opções", 60, 40, WHITE);
+            DrawUIText("Vídeo, sensibilidade, multiplayer e controles", 360, 120, 22, LIGHTGRAY);
+
+            Rectangle backRect = {(SCREEN_WIDTH - 260) / 2.0f, 620, 260, 52};
+            if (DrawButton("Voltar", backRect, GRAY)) {
+                state = STATE_PAUSED;
+            }
+
+            int tabY = 170;
+            Rectangle videoRect = {(float)220, (float)tabY, 180.0f, 44.0f};
+            Rectangle sensRect = {(float)420, (float)tabY, 180.0f, 44.0f};
+            Rectangle multiRect = {(float)620, (float)tabY, 180.0f, 44.0f};
+            Rectangle controlsRect = {(float)820, (float)tabY, 180.0f, 44.0f};
+            if (DrawButton("Vídeo", videoRect, optionsTab == 0 ? BLUE : LIGHTGRAY)) optionsTab = 0;
+            if (DrawButton("Sensibilidade", sensRect, optionsTab == 1 ? BLUE : LIGHTGRAY)) optionsTab = 1;
+            if (DrawButton("Multiplayer", multiRect, optionsTab == 2 ? BLUE : LIGHTGRAY)) optionsTab = 2;
+            if (DrawButton("Controles", controlsRect, optionsTab == 3 ? BLUE : LIGHTGRAY)) optionsTab = 3;
+
+            Rectangle panel = {180, 240, 920, 340};
+            DrawRectangleRec(panel, Fade(DARKBLUE, 0.22f));
+            DrawRectangleLinesEx(panel, 2, Fade(WHITE, 0.7f));
+
+            if (optionsTab == 0) {
+                DrawUIText("Vídeo", 220, 270, 28, WHITE);
+                DrawUIText("Raio de renderização", 220, 320, 22, LIGHTGRAY);
+                DrawUIText(TextFormat("%d", renderRadius), 500, 320, 22, WHITE);
+                Rectangle minusR = {560, 315, 38, 34};
+                Rectangle plusR = {610, 315, 38, 34};
+                if (DrawButton("-", minusR, LIGHTGRAY)) renderRadius = ClampInt(renderRadius - 1, 1, 6);
+                if (DrawButton("+", plusR, LIGHTGRAY)) renderRadius = ClampInt(renderRadius + 1, 1, 6);
+
+                DrawUIText("Chunks por quadro", 220, 370, 22, LIGHTGRAY);
+                DrawUIText(TextFormat("%d", chunksPerFrame), 500, 370, 22, WHITE);
+                Rectangle minusC = {560, 365, 38, 34};
+                Rectangle plusC = {610, 365, 38, 34};
+                if (DrawButton("-", minusC, LIGHTGRAY)) chunksPerFrame = ClampInt(chunksPerFrame - 1, 1, 4);
+                if (DrawButton("+", plusC, LIGHTGRAY)) chunksPerFrame = ClampInt(chunksPerFrame + 1, 1, 4);
+
+                DrawUIText("Qualidade gráfica", 220, 420, 22, LIGHTGRAY);
+                if (DrawButton(fancyGraphics ? "Alta" : "Baixa", {220, 450, 160, 42}, BLUE)) {
+                    fancyGraphics = !fancyGraphics;
+                    if (!fancyGraphics) {
+                        renderRadius = 1;
+                        chunksPerFrame = 1;
+                    } else {
+                        renderRadius = 2;
+                        chunksPerFrame = 2;
+                    }
+                }
+            } else if (optionsTab == 1) {
+                DrawUIText("Sensibilidade", 220, 270, 28, WHITE);
+                DrawUIText("Mouse", 220, 320, 22, LIGHTGRAY);
+                DrawUIText(TextFormat("%.3f", mouseSensitivity), 500, 320, 22, WHITE);
+                Rectangle minusS = {560, 315, 38, 34};
+                Rectangle plusS = {610, 315, 38, 34};
+                if (DrawButton("-", minusS, LIGHTGRAY)) mouseSensitivity = ClampFloat(mouseSensitivity - 0.0005f, 0.001f, 0.01f);
+                if (DrawButton("+", plusS, LIGHTGRAY)) mouseSensitivity = ClampFloat(mouseSensitivity + 0.0005f, 0.001f, 0.01f);
+            } else if (optionsTab == 2) {
+                DrawUIText("Multiplayer", 220, 270, 28, WHITE);
+                DrawUIText("Co-op local", 220, 320, 22, LIGHTGRAY);
+                if (DrawButton(multiplayerEnabled ? "Ativado" : "Desativado", {220, 350, 220, 46}, multiplayerEnabled ? GREEN : ORANGE)) {
+                    multiplayerEnabled = !multiplayerEnabled;
+                }
+            } else if (optionsTab == 3) {
+                DrawUIText("Controles", 220, 270, 28, WHITE);
+                DrawUIText("WASD = mover", 220, 320, 22, LIGHTGRAY);
+                DrawUIText("Mouse = olhar", 220, 350, 22, LIGHTGRAY);
+                DrawUIText("Espaço = subir", 220, 380, 22, LIGHTGRAY);
+                DrawUIText("Shift = descer", 220, 410, 22, LIGHTGRAY);
+                DrawUIText("T = abrir chat", 220, 440, 22, LIGHTGRAY);
+                DrawUIText("Esc = pausar", 220, 470, 22, LIGHTGRAY);
+                if (DrawButton("Restaurar", {220, 500, 180, 42}, LIGHTGRAY)) {
+                    multiplayerEnabled = false;
+                    mouseSensitivity = 0.0035f;
+                    renderRadius = 2;
+                    chunksPerFrame = 2;
+                }
+            }
+        }
+
+        else if (state == STATE_PAUSED) {
+            // Pause overlay
+            DrawRectangleRec({0,0,(float)SCREEN_WIDTH,(float)SCREEN_HEIGHT}, Fade(BLACK, 0.4f));
+            DrawCenteredText("Pausado", 80, 48, WHITE);
+            Rectangle resumeRect = {(SCREEN_WIDTH - 300) / 2.0f, 150, 300, 60};
+            Rectangle saveRect = {(SCREEN_WIDTH - 300) / 2.0f, 230, 300, 60};
+            Rectangle optionsRect = {(SCREEN_WIDTH - 300) / 2.0f, 310, 300, 60};
+            Rectangle deleteWorldRect = {(SCREEN_WIDTH - 300) / 2.0f, 390, 300, 60};
+
+            if (DrawButton("Continuar", resumeRect, GREEN)) {
+                state = STATE_GAME;
+            }
+            if (DrawButton("Salvar", saveRect, SKYBLUE)) {
+                // save metadata and all generated chunks
+                SaveWorldMetadata(currentWorld);
+                // save all chunks
+                for (auto &kv : chunks) {
+                    SaveChunkToDisk(kv.first.x, kv.first.z, kv.second);
+                }
+            }
+            if (DrawButton("Opções", optionsRect, LIGHTGRAY)) {
+                optionsTab = 0;
+                state = STATE_OPTIONS;
+            }
+            if (DrawButton("Apagar Mundo", deleteWorldRect, RED)) {
+                if (DeleteWorld(currentWorld.name)) {
+                    state = STATE_SINGLEPLAYER_MENU;
+                }
+            }
+            Rectangle quitRect = {(SCREEN_WIDTH - 300) / 2.0f, 550, 300, 60};
+            if (DrawButton("Sair ao Menu", quitRect, RED)) {
+                // save before quitting to menu
+                SaveWorldMetadata(currentWorld);
+                for (auto &kv : chunks) {
+                    SaveChunkToDisk(kv.first.x, kv.first.z, kv.second);
+                }
+                chunks.clear();
+                state = STATE_LOBBY;
+            }
+        }
+
+        EndDrawing();
+    }
+
+    for (int i = 0; i < BLOCK_NUM_TYPES; i++) {
+        if (textures[i].id != 0) UnloadTexture(textures[i]);
+    }
+    UnloadUIResources();
+    CloseWindow();
+    return 0;
+}
+
+// Entry point for Windows console applications
+int main() {
+    return RunMinecraftRaylib();
+}
