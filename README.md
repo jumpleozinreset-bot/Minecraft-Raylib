@@ -17,7 +17,7 @@ Um clone de Minecraft desenvolvido do zero em **C++**, utilizando a biblioteca *
 ### 🎨 Customização
 * **Suporte a Resource Packs:** Altere completamente o visual do jogo! O sistema carrega texturas e elementos visuais externamente através de pacotes de recursos customizados.
 ### 📗 Bibliotecas e ações precisas
-* **MSYS2, adicionar MSYS2 para o PATH do Windows** 
+* **MSYS2, adicionar MSYS2 para o PATH do Windows** *
 ---
 
 ## 🛠️ Tecnologias Utilizadas
